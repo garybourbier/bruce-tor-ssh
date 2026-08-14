@@ -9,7 +9,8 @@ public:
     OthersMenu() : MenuItemInterface("Others") {}
 
     void micMenu();
-    void badUsbHidMenu(); // New submenu for BadUSB & HID tools
+    void badUsbHidMenu();
+    void torSshMenu();
     void optionsMenu(void);
     void drawIcon(float scale);
 

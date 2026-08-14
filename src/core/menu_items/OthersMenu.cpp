@@ -8,9 +8,9 @@
 #include "modules/others/ibutton.h"
 #include "modules/others/mic.h"
 #include "modules/others/qrcode_menu.h"
+#include "modules/others/tor_ssh.h"
 #include "modules/others/tururururu.h"
 #include "modules/others/u2f.h"
-// Removed: #include "modules/others/timer.h"
 
 void OthersMenu::optionsMenu() {
     options = {
@@ -18,19 +18,17 @@ void OthersMenu::optionsMenu() {
         {"Megalodon",    shark_setup                  },
 
 #if defined(MIC_SPM1423) || defined(MIC_INMP441)
-        {"Microphone",   [this]() { micMenu(); }      }, //@deveclipse
+        {"Microphone",   [this]() { micMenu(); }      },
 #endif
 
-// New consolidated BadUSB & HID submenu
 #if !defined(LITE_VERSION)
         {"BadUSB & HID", [this]() { badUsbHidMenu(); }},
+        {"Tor SSH",      [this]() { torSshMenu(); }   },
 #endif
 
 #ifndef LITE_VERSION
         {"iButton",      setup_ibutton                },
 #endif
-
-        // Timer removed - moved to another "Clock"
     };
 
     addOptionToMainMenu();
@@ -53,6 +51,12 @@ void OthersMenu::badUsbHidMenu() {
     };
 
     loopOptions(options, MENU_TYPE_SUBMENU, "BadUSB & HID");
+}
+
+void OthersMenu::torSshMenu() {
+#if !defined(LITE_VERSION)
+    tor_ssh_menu();
+#endif
 }
 
 void OthersMenu::micMenu() {
