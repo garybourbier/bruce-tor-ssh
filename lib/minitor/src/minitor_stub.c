@@ -1,33 +1,21 @@
 /*
- * minitor_stub.c
- *
- * Stub implementations that compile but abort at runtime with a clear message.
- * Replace by populating the real Minitor submodule and setting -DMINITOR_READY=1.
+ * Stub implementations — compile but fail at runtime.
+ * Replaced by real Minitor when -DMINITOR_READY=1 and submodule populated.
  */
-
 #ifndef MINITOR_READY
 
 #include <stdio.h>
 #include "minitor.h"
 
 int d_minitor_INIT(void) {
-    printf("[minitor] STUB: populate lib/minitor/src/minitor/ submodule and set -DMINITOR_READY=1\n");
+    printf("[minitor] STUB: set -DMINITOR_READY=1 after running setup_minitor.sh\n");
     return -1;
 }
 
-int d_setup_onion_service(int local_port, int onion_port, const char *data_dir) {
-    (void)local_port; (void)onion_port; (void)data_dir;
+int d_setup_onion_service(unsigned short local_port, unsigned short exit_port, const char *dir) {
+    (void)local_port; (void)exit_port; (void)dir;
     printf("[minitor] STUB: d_setup_onion_service not implemented\n");
     return -1;
-}
-
-const char *d_minitor_get_onion_address(const char *data_dir) {
-    (void)data_dir;
-    return "stub_not_ready.onion";
-}
-
-void d_minitor_cleanup(void) {
-    printf("[minitor] STUB: cleanup\n");
 }
 
 #endif /* !MINITOR_READY */

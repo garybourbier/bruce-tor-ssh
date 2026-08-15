@@ -1,18 +1,40 @@
 {
   "name": "minitor",
   "version": "0.1.0",
-  "description": "Embedded Tor hidden service implementation for ESP32 (Triple-Layer-Development fork)",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/Triple-Layer-Development/minitor"
-  },
-  "frameworks": ["espidf", "arduino"],
+  "description": "Embedded Tor hidden service for ESP32 — Triple-Layer-Development/Minitor + jpbland1/wolfssl",
+  "frameworks": ["arduino"],
   "platforms": ["espressif32"],
   "build": {
-    "srcDir": "src",
+    "srcDirs": [
+      "src/minitor/src",
+      "src/minitor/src/models",
+      "src/minitor/src/structures",
+      "src/wolfssl/src",
+      "src/wolfssl/wolfcrypt/src"
+    ],
+    "includeDir": "src",
     "flags": [
       "-Ilib/minitor/src",
-      "-Ilib/minitor/src/wolfssl"
+      "-Ilib/minitor/src/minitor/include",
+      "-Ilib/minitor/src/minitor/h",
+      "-Ilib/minitor/src/wolfssl",
+      "-Ilib/minitor/src/wolfssl/wolfssl",
+      "-DWOLFSSL_USER_SETTINGS",
+      "-DHAVE_ED25519",
+      "-DHAVE_CURVE25519",
+      "-DHAVE_CHACHA",
+      "-DHAVE_POLY1305",
+      "-DHAVE_SHA3",
+      "-DNO_RSA",
+      "-DNO_DH",
+      "-DNO_DSA",
+      "-DNO_MD4",
+      "-DNO_MD5",
+      "-DNO_RC4",
+      "-DNO_OLD_TLS",
+      "-DMINIMUM_TLS_VERSION=0x0303",
+      "-DFILESYSTEM_PREFIX='\"/sd/tor/\"'",
+      "-DDEBUG_MINITOR"
     ]
   }
 }
