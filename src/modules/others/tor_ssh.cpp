@@ -59,8 +59,8 @@ static volatile bool g_tor_in_consensus = false;
 // generates keys inside it.  Must NOT be pre-created; if the dir exists
 // Minitor assumes keys are already present and skips key generation.
 #define TOR_ONION_DIR       "/sd/tor_ssh/hs"
-// SSH host key file (persisted on SD — generated once)
-#define TOR_SSH_HOST_KEY    "/sd/tor_ssh/ssh_host_rsa_key"
+// SSH host key file (persisted on SD — generated once, reused every boot)
+#define TOR_SSH_HOST_KEY    "/sd/tor_ssh/ssh_host_ecdsa_key"
 
 // ── Internal state ─────────────────────────────────────────────────────────────
 
@@ -85,65 +85,100 @@ static void _sdlog(const char *msg) {
 }
 
 // ── Display helpers ────────────────────────────────────────────────────────────
+// Layout (320x170 landscape).  The screen is intentionally FROZEN during the Tor
+// consensus download: the ST7789 and the SD card sit on one shared SPI bus
+// (TFT_CS=41, SDCARD_CS=13) and Minitor drives the SD through the ESP-IDF sdspi
+// VFS — outside the Arduino SPI lock — so any TFT write while consensus is
+// running corrupts the bus.  We therefore draw only at safe points and reserve
+// fixed regions so status text can never bleed into the progress bar.
+#define UI_PHASE_Y     24                        // current-step line under the header
+#define UI_DETAIL_Y0   40                        // top of the scrolling detail region
+#define UI_BAR_H       14
+#define UI_LINE_H      10                         // FP font (6x8) + 2px leading
+#define UI_BAR_Y       (tftHeight - UI_BAR_H - 6)
+#define UI_DETAIL_BOT  (UI_BAR_Y - 4)             // detail region must stop above the bar
+
+static int _detail_y = UI_DETAIL_Y0;
 
 static void _header(const char *title) {
     tft.fillScreen(bruceConfig.bgColor);
     tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
     tft.setTextSize(FM);
-    tft.drawCentreString(title, tftWidth / 2, 4, 1);
+    tft.drawCentreString(title, tftWidth / 2, 3, 1);
     tft.drawLine(0, 20, tftWidth, 20, bruceConfig.priColor);
     tft.setTextSize(FP);
-    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
-    tft.setCursor(4, 26);
+    _detail_y = UI_DETAIL_Y0;
 }
 
+// Print one detail line inside the bounded region.  When the region is full we
+// wrap back to its top (clearing it) instead of ever overwriting the bar.
 static void _status(const char *msg, uint16_t color = TFT_WHITE) {
+    if (_detail_y + UI_LINE_H > UI_DETAIL_BOT) {
+        tft.fillRect(0, UI_DETAIL_Y0, tftWidth, UI_DETAIL_BOT - UI_DETAIL_Y0, bruceConfig.bgColor);
+        _detail_y = UI_DETAIL_Y0;
+    }
+    tft.setTextSize(FP);
     tft.setTextColor(color, bruceConfig.bgColor);
-    tft.println(msg);
-    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+    tft.setCursor(4, _detail_y);
+    tft.print(msg);
+    _detail_y += UI_LINE_H;
 }
 
+// Draw the current phase name (own cleared line) plus the progress bar with the
+// percentage centred inside it.  Resets the detail region so each phase starts
+// with a clean slate below its title — no leftover text near the bar.
 static void _progress(uint8_t pct, const char *label) {
-    int bar_y  = tftHeight - 24;
-    int bar_w  = tftWidth - 16;
-    int fill_w = (bar_w * pct) / 100;
-
-    tft.fillRect(8, bar_y, bar_w, 12, bruceConfig.bgColor);
-    tft.drawRect(8, bar_y, bar_w, 12, bruceConfig.priColor);
-    if (fill_w > 0)
-        tft.fillRect(9, bar_y + 1, fill_w - 1, 10, bruceConfig.priColor);
-
-    tft.fillRect(0, bar_y - 14, tftWidth, 12, bruceConfig.bgColor);
-    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+    // phase line
+    tft.fillRect(0, UI_PHASE_Y, tftWidth, UI_LINE_H, bruceConfig.bgColor);
     tft.setTextSize(FP);
-    tft.setCursor(8, bar_y - 12);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setCursor(4, UI_PHASE_Y);
     tft.print(label);
+
+    // fresh detail region for this phase
+    tft.fillRect(0, UI_DETAIL_Y0, tftWidth, UI_DETAIL_BOT - UI_DETAIL_Y0, bruceConfig.bgColor);
+    _detail_y = UI_DETAIL_Y0;
+
+    // progress bar
+    int bar_w  = tftWidth - 16;
+    int fill_w = (bar_w - 2) * pct / 100;
+    tft.drawRect(8, UI_BAR_Y, bar_w, UI_BAR_H, bruceConfig.priColor);
+    tft.fillRect(9, UI_BAR_Y + 1, bar_w - 2, UI_BAR_H - 2, bruceConfig.bgColor);
+    if (fill_w > 0)
+        tft.fillRect(9, UI_BAR_Y + 1, fill_w, UI_BAR_H - 2, bruceConfig.priColor);
+
+    // percentage centred inside the bar; transparent bg so it sits over the fill
+    char pctbuf[8];
+    snprintf(pctbuf, sizeof(pctbuf), "%u%%", (unsigned)pct);
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString(pctbuf, tftWidth / 2, UI_BAR_Y + 3, 1);
 }
 
 static void _show_onion(const char *addr) {
     tft.fillScreen(bruceConfig.bgColor);
     tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
     tft.setTextSize(FM);
-    tft.drawCentreString("Tor SSH Ready", tftWidth / 2, 4, 1);
-    tft.drawLine(0, 20, tftWidth, 20, bruceConfig.priColor);
+    tft.drawCentreString("Tor SSH  Ready", tftWidth / 2, 4, 1);
+    tft.drawLine(0, 24, tftWidth, 24, bruceConfig.priColor);
 
     tft.setTextSize(FP);
-    tft.setCursor(4, 28);
     tft.setTextColor(TFT_GREEN, bruceConfig.bgColor);
-    tft.println("ssh bruce@");
+    tft.drawString("ssh bruce@<onion>  -p 22", 8, 34);
 
-    // Split .onion across two lines for the narrow 170px display
+    // .onion in a bordered box, split across two lines to fit the 320px width
     String a = String(addr);
+    int box_y = 50;
+    tft.drawRect(4, box_y, tftWidth - 8, 32, bruceConfig.priColor);
     tft.setTextColor(TFT_CYAN, bruceConfig.bgColor);
-    tft.println(a.substring(0, a.length() / 2));
-    tft.println(a.substring(a.length() / 2));
+    tft.drawString(a.substring(0, a.length() / 2), 10, box_y + 5);
+    tft.drawString(a.substring(a.length() / 2),     10, box_y + 17);
 
-    tft.println();
     tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
-    tft.println("port: 22  user: bruce");
-    tft.println();
+    tft.drawString("user: bruce    any password", 8, 92);
+
     tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
-    tft.println("ESC = stop");
+    tft.drawString("service live  -  ESC to stop", 8, tftHeight - 14);
 
     Serial.printf("[TorSSH] .onion: %s\n", addr);
 }
@@ -408,9 +443,11 @@ static bool _init_tor() {
         }
     }
 
-    _progress(18, "Connecting to Tor network...");
-    _status("First run ~5-10 min", TFT_DARKGREY);
-    _status("Cached on SD = faster restart", TFT_DARKGREY);
+    _progress(18, "Downloading Tor consensus");
+    _status("Takes 5-10 min on first run.", TFT_DARKGREY);
+    _status("Screen stays still while it", TFT_DARKGREY);
+    _status("works - this is normal.", TFT_DARKGREY);
+    _status("SD cache speeds up restarts.", TFT_DARKGREY);
 
     char buf[128];
     snprintf(buf, sizeof(buf), "[TOR] heap before init=%lu", (unsigned long)ESP.getFreeHeap());
@@ -513,15 +550,69 @@ static bool _init_ssh() {
     // the ESP32-S3 hardware SHA engine.  ECDSA P256 avoids SHA512 entirely —
     // it uses the DRBG (seeded above with esp_fill_random) and pure-software
     // ECC math, so no hardware contention.
-    _status("Generating SSH host key...", TFT_DARKGREY);
-    _sdlog("[SSH] keygen ECDSA P256 start");
-    ssh_pki_generate(SSH_KEYTYPE_ECDSA_P256, 256, &g_host_key);
-    if (!g_host_key) {
-        _sdlog("[SSH] FATAL: keygen ECDSA P256 failed");
-        _status("Host key error!", TFT_RED);
-        return false;
+    // Persistent SSH host key.  Reuse the key stored on SD if present so clients
+    // don't get a "REMOTE HOST IDENTIFICATION HAS CHANGED" warning after every
+    // reboot; only generate on first run.  The key lives unencrypted on the SD
+    // card — acceptable here since holding the card == holding the device.
+    //
+    // We do the file I/O ourselves with POSIX open()/read()/write() and hand
+    // libssh only in-memory base64: libssh's fopen()-based ssh_pki_*_file path
+    // fails on the ESP-IDF FAT VFS, and its PEM export is a stub in the
+    // mbedcrypto backend — only the OpenSSH base64 container is implemented.
+    g_host_key = nullptr;
+    {
+        int kfd = open(TOR_SSH_HOST_KEY, O_RDONLY);
+        if (kfd >= 0) {
+            char kbuf[2048];
+            ssize_t kn = read(kfd, kbuf, sizeof(kbuf) - 1);
+            close(kfd);
+            if (kn > 0) {
+                kbuf[kn] = '\0';
+                if (ssh_pki_import_privkey_base64(kbuf, nullptr, nullptr, nullptr, &g_host_key) == SSH_OK
+                    && g_host_key) {
+                    _sdlog("[SSH] host key loaded from SD");
+                    _status("SSH host key loaded", TFT_GREEN);
+                } else {
+                    g_host_key = nullptr;
+                    _sdlog("[SSH] WARN: stored host key invalid — regenerating");
+                }
+            }
+        }
     }
-    _sdlog("[SSH] keygen ECDSA P256 OK");
+
+    if (!g_host_key) {
+        _status("Generating SSH host key...", TFT_DARKGREY);
+        _sdlog("[SSH] keygen ECDSA P256 start");
+        ssh_pki_generate(SSH_KEYTYPE_ECDSA_P256, 256, &g_host_key);
+        if (!g_host_key) {
+            _sdlog("[SSH] FATAL: keygen ECDSA P256 failed");
+            _status("Host key error!", TFT_RED);
+            return false;
+        }
+        _sdlog("[SSH] keygen ECDSA P256 OK");
+
+        // Persist for next boot: OpenSSH base64 in memory, then POSIX write.
+        // passphrase MUST be NULL, not "": the OpenSSH exporter treats any
+        // non-NULL passphrase as "encrypt me" and the bcrypt/AES KDF path is not
+        // usable in the mbedcrypto backend, which made the export fail.
+        char *b64 = nullptr;
+        if (ssh_pki_export_privkey_base64_format(g_host_key, nullptr, nullptr, nullptr,
+                                                 &b64, SSH_FILE_FORMAT_OPENSSH) == SSH_OK && b64) {
+            int wfd = open(TOR_SSH_HOST_KEY, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (wfd >= 0) {
+                size_t blen = strlen(b64);
+                bool ok = (write(wfd, b64, blen) == (ssize_t)blen);
+                fsync(wfd);
+                close(wfd);
+                _sdlog(ok ? "[SSH] host key saved to SD" : "[SSH] WARN: host key write failed");
+            } else {
+                _sdlog("[SSH] WARN: cannot open host key file for write");
+            }
+            ssh_string_free_char(b64);
+        } else {
+            _sdlog("[SSH] WARN: host key export failed (regen next boot)");
+        }
+    }
 
     snprintf(buf, sizeof(buf), "[SSH] heap after keygen=%lu", (unsigned long)ESP.getFreeHeap());
     _sdlog(buf);
@@ -600,6 +691,8 @@ static StaticTask_t *g_worker_tcb     = nullptr;
 static volatile bool g_worker_done    = false;
 
 static void _tor_ssh_worker(void *) {
+    // Redraw a clean frame — the WiFi selector may have painted over the screen.
+    _header("Tor SSH");
     if (_init_ssh()) {
         if (_init_tor()) {
             _show_onion(g_onion_addr);
@@ -654,10 +747,11 @@ void tor_ssh_menu() {
         snprintf(buf, sizeof(buf), "[WIFI] OK ip=%s", WiFi.localIP().toString().c_str());
         _sdlog(buf);
     }
-    tft.print("WiFi: ");
-    tft.setTextColor(TFT_GREEN, bruceConfig.bgColor);
-    tft.println(WiFi.localIP().toString());
-    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+    {
+        char ipmsg[48];
+        snprintf(ipmsg, sizeof(ipmsg), "WiFi OK: %s", WiFi.localIP().toString().c_str());
+        _status(ipmsg, TFT_GREEN);
+    }
 
     // Allocate 64KB worker stack in PSRAM — WiFi driver has claimed most internal
     // SRAM (~50KB DMA buffers), so even 24KB xTaskCreate fails at this point.
