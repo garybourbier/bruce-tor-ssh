@@ -1,6 +1,6 @@
 [submodule "lib/minitor/src/minitor"]
 	path = lib/minitor/src/minitor
-	url = https://github.com/Triple-Layer-Development/minitor
+	url = https://github.com/garybourbier/minitor.git
 [submodule "lib/minitor/src/wolfssl"]
 	path = lib/minitor/src/wolfssl
 	url = https://github.com/jpbland1/wolfssl
