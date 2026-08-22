@@ -20,6 +20,9 @@
 #include <esp_heap_caps.h>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <time.h>
+#include <cstdio>
+#include <cstring>
 
 #include "core/sd_functions.h"
 
@@ -378,22 +381,69 @@ done:
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────────
 
+// Firmware build instant, from __DATE__/__TIME__, as a UTC epoch. The device can
+// never legitimately run before it was compiled, so this is a hard lower bound on
+// any trustworthy clock. Requires TZ to be 0-offset (configTime(0,0,...)) so
+// mktime() interprets the build tm as UTC. __TIME__ is the build machine's local
+// time, but the day of margin the caller subtracts absorbs that skew.
+static time_t _build_epoch() {
+    char mon_str[4] = {0};
+    int day = 0, year = 0, hh = 0, mm = 0, ss = 0;
+    sscanf(__DATE__, "%3s %d %d", mon_str, &day, &year);
+    sscanf(__TIME__, "%d:%d:%d", &hh, &mm, &ss);
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    const char* p = strstr(months, mon_str);
+    int mon = p ? (int)((p - months) / 3) : 0;
+    struct tm t = {0};
+    t.tm_year = year - 1900;
+    t.tm_mon = mon;
+    t.tm_mday = day;
+    t.tm_hour = hh;
+    t.tm_min = mm;
+    t.tm_sec = ss;
+    t.tm_isdst = 0;
+    return mktime(&t);
+}
+
 static bool _init_tor() {
 
     _progress(5, "Syncing time...");
-    // Minitor uses time() for consensus freshness. Without NTP, clock=0 since epoch
-    // and ALL consensus files appear valid → stale cache accepted, or DA selection
-    // breaks (srand(0) → same DA every retry).
-    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    // Minitor derives the HS time period purely from the consensus valid_after and
+    // uses time() to reject stale consensus files. A wrong (past) clock makes it
+    // accept an expired consensus → descriptor blinded for a past time period →
+    // every HSDir returns 400 → service unreachable. A bad NTP reply that still
+    // looks plausible (observed: a boot 63 days in the past) sails past a mere
+    // "clock != 0" check. So require the clock to reach at least the firmware
+    // build date (minus a day of margin for TZ/build skew) before we trust it.
     {
+        const time_t floor = _build_epoch() - 86400;  // 1 day of margin
         time_t now = 0;
-        for (int i = 0; i < 20 && now < 1000000000UL; i++) {
+        bool synced = false;
+
+        configTime(0, 0, "pool.ntp.org", "time.cloudflare.com", "time.google.com");
+
+        for (int i = 0; i < 120; i++) {   // up to ~60 s
             delay(500);
             time(&now);
+            if (now >= floor) { synced = true; break; }
+            if (i == 60) {                // re-kick SNTP halfway through
+                configTime(0, 0, "pool.ntp.org", "time.cloudflare.com", "time.google.com");
+            }
         }
-        char buf[64];
-        snprintf(buf, sizeof(buf), "[TIME] NTP=%lu", (unsigned long)now);
+
+        char buf[80];
+        snprintf(buf, sizeof(buf), "[TIME] NTP=%lu floor=%lu synced=%d",
+                 (unsigned long)now, (unsigned long)floor, synced ? 1 : 0);
         _sdlog(buf);
+
+        if (!synced) {
+            // No trustworthy clock: starting anyway would publish a descriptor for
+            // the wrong time period and be silently unreachable. Fail loudly instead.
+            _sdlog("[TIME] FATAL: no trustworthy clock (NTP failed) — aborting");
+            _status("NTP sync failed!", TFT_RED);
+            _status("(clock untrusted, retry)", TFT_RED);
+            return false;
+        }
     }
 
     // ── Diagnostic 1 : POSIX VFS sur SD ─────────────────────────────────────────
