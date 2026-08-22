@@ -18,6 +18,7 @@
 #include "menu_items/RFIDMenu.h"
 #include "menu_items/RFMenu.h"
 #include "menu_items/ScriptsMenu.h"
+#include "menu_items/TorMenu.h"
 #include "menu_items/WifiMenu.h"
 class MainMenu {
 public:
@@ -38,6 +39,7 @@ public:
 #if !defined(LITE_VERSION)
     LoRaMenu loraMenu;
     EthernetMenu ethernetMenu;
+    TorMenu torMenu;
 #endif
 
     MainMenu();

@@ -23,7 +23,6 @@ void OthersMenu::optionsMenu() {
 
 #if !defined(LITE_VERSION)
         {"BadUSB & HID", [this]() { badUsbHidMenu(); }},
-        {"Tor SSH",      [this]() { torSshMenu(); }   },
 #endif
 
 #ifndef LITE_VERSION

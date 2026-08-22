@@ -23,6 +23,7 @@
 #include <time.h>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "core/sd_functions.h"
 
@@ -879,6 +880,55 @@ static void _tor_ssh_worker(void *) {
 
 // ── Public entry point ─────────────────────────────────────────────────────────
 
+// On-device mode picker shown when the Tor SSH app starts. Returns false if the
+// user backs out. Writes/removes the gateway config (forward.txt); the worker
+// reads it at startup to pick local-shell vs gateway mode.
+static bool _select_tor_mode() {
+    _load_forward_config();
+
+    bool proceed = false;
+    std::vector<Option> options;
+
+    options.push_back({"Local shell", [&]() {
+        remove(TOR_SSH_FORWARD_CFG);
+        proceed = true;
+    }});
+
+    String gwLabel = g_forward_mode
+        ? (String("Gateway ") + g_forward_ip + ":" + String(g_forward_port))
+        : String("Gateway -> PC...");
+    options.push_back({gwLabel.c_str(), [&]() {
+        String def = g_forward_mode
+            ? (String(g_forward_ip) + ":" + String(g_forward_port))
+            : String("192.168.1.10:22");
+        String in = keyboard(def, 21, "Backend IP:PORT");
+        char ip[16] = {0};
+        int port = 0;
+        if (sscanf(in.c_str(), "%15[0-9.]:%d", ip, &port) == 2 && port > 0 && port < 65536) {
+            int fd = open(TOR_SSH_FORWARD_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd >= 0) {
+                char l[32];
+                int n = snprintf(l, sizeof(l), "%s:%d\n", ip, port);
+                write(fd, l, n);
+                fsync(fd);
+                close(fd);
+                proceed = true;
+            } else {
+                _status("Cannot write config", TFT_RED);
+                delay(1500);
+            }
+        } else {
+            _status("Bad IP:PORT", TFT_RED);
+            delay(1500);
+        }
+    }});
+
+    options.push_back({"Back", [&]() { proceed = false; }});
+
+    loopOptions(options, MENU_TYPE_SUBMENU, "Tor Mode");
+    return proceed;
+}
+
 void tor_ssh_menu() {
     _header("Tor SSH");
 
@@ -894,6 +944,10 @@ void tor_ssh_menu() {
             close(lfd);
         }
     }
+
+    // Mode picker: local shell vs gateway-to-LAN. Writes forward.txt; the worker
+    // reads it below. Backing out returns to the Others menu.
+    if (!_select_tor_mode()) return;
 
     // WiFi — low stack, fine in main task
     _sdlog("[WIFI] checking...");

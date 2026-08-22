@@ -26,6 +26,9 @@ MainMenu::MainMenu() {
         &scriptsMenu,
 #endif
         &clockMenu,
+#if !defined(LITE_VERSION)
+        &torMenu,
+#endif
         &othersMenu,
         &configMenu,
     };
