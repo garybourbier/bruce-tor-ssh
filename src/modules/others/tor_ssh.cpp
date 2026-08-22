@@ -20,6 +20,10 @@
 #include <esp_heap_caps.h>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
 #include <time.h>
 #include <cstdio>
 #include <cstring>
@@ -50,6 +54,9 @@ extern volatile int g_minitor_relay_count;
 // Repoint where incoming .onion streams are forwarded (default loopback). Used
 // by gateway mode to relay to a LAN backend instead of the on-device server.
 void v_set_local_connection_addr(const char *addr);
+// Register a progress callback invoked (on Minitor's relay task) during the
+// consensus fetch, so we can animate the on-screen progress safely.
+void v_set_minitor_progress_cb(void (*cb)(int));
 }
 
 // Set to true while worker is blocked in d_minitor_INIT() consensus download.
@@ -187,6 +194,35 @@ static void _progress(uint8_t pct, const char *label) {
     tft.setTextSize(FP);
     tft.setTextColor(TFT_WHITE);
     tft.drawCentreString(pctbuf, tftWidth / 2, UI_BAR_Y + 3, 1);
+}
+
+// Live consensus-fetch progress. Called from Minitor's relay task (same task as
+// the SD relay inserts, so drawing to the shared SPI display here is serialized
+// and bus-safe). Grows the bar 18->55% by relay count and shows a live counter,
+// so the screen no longer looks frozen during the download.
+static void _draw_fetch_progress(int count) {
+    // full consensus is a few thousand relays; map to the 18..55% band
+    int capped = count > 8000 ? 8000 : count;
+    int pct = 18 + capped * 37 / 8000;
+
+    int bar_w = tftWidth - 16;
+    int fill_w = (bar_w - 2) * pct / 100;
+    tft.fillRect(9, UI_BAR_Y + 1, bar_w - 2, UI_BAR_H - 2, bruceConfig.bgColor);
+    if (fill_w > 0) tft.fillRect(9, UI_BAR_Y + 1, fill_w, UI_BAR_H - 2, bruceConfig.priColor);
+    char pctbuf[8];
+    snprintf(pctbuf, sizeof(pctbuf), "%u%%", (unsigned)pct);
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString(pctbuf, tftWidth / 2, UI_BAR_Y + 3, 1);
+
+    // live relay counter on the first detail line
+    char b[32];
+    snprintf(b, sizeof(b), "Relays: %d", count);
+    tft.fillRect(0, UI_DETAIL_Y0, tftWidth, UI_LINE_H, bruceConfig.bgColor);
+    tft.setTextSize(FP);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setCursor(4, UI_DETAIL_Y0);
+    tft.print(b);
 }
 
 static void _show_onion(const char *addr) {
@@ -371,6 +407,75 @@ static bool _handle_ssh_cmd(ssh_session session, ssh_channel ch, const char *cmd
     return true;
 }
 
+// Jump-host / port-forward: bridge a client "direct-tcpip" channel to a TCP
+// socket on the LAN. Enables `ssh -J bruce@onion user@host`, `ssh -L`, `ssh -D`
+// through the board. Target host must be a numeric IP (no DNS on this side).
+static void _run_direct_tcpip(ssh_channel ch, const char *host, int port) {
+    char logbuf[96];
+    snprintf(logbuf, sizeof(logbuf), "[SSH] direct-tcpip -> %s:%d", host ? host : "?", port);
+    _sdlog(logbuf);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        ssh_channel_close(ch);
+        ssh_channel_free(ch);
+        return;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = host ? inet_addr(host) : (uint32_t)0xFFFFFFFFUL;
+
+    if (addr.sin_addr.s_addr == (uint32_t)0xFFFFFFFFUL ||
+        connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        _sdlog("[SSH] direct-tcpip connect failed");
+        close(sock);
+        ssh_channel_send_eof(ch);
+        ssh_channel_close(ch);
+        ssh_channel_free(ch);
+        return;
+    }
+
+    int fl = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, fl | O_NONBLOCK);
+
+    uint8_t buf[1024];
+    while (!ssh_channel_is_closed(ch)) {
+        bool idle = true;
+
+        // client -> target
+        int n = ssh_channel_read_timeout(ch, buf, sizeof(buf), 0, 20);
+        if (n > 0) {
+            send(sock, buf, n, 0);
+            idle = false;
+        } else if (n == SSH_ERROR) {
+            break;
+        }
+        if (ssh_channel_is_eof(ch)) break;
+
+        // target -> client
+        int m = recv(sock, buf, sizeof(buf), 0);
+        if (m > 0) {
+            ssh_channel_write(ch, buf, m);
+            idle = false;
+        } else if (m == 0) {
+            break; // target closed
+        } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            break;
+        }
+
+        if (check(EscPress)) break;
+        if (idle) delay(2);
+    }
+
+    close(sock);
+    ssh_channel_send_eof(ch);
+    ssh_channel_close(ch);
+    ssh_channel_free(ch);
+}
+
 static void _run_session(ssh_session session) {
     if (ssh_handle_key_exchange(session) != SSH_OK) {
         Serial.printf("[TorSSH] key exchange: %s\n", ssh_get_error(session));
@@ -401,6 +506,9 @@ static void _run_session(ssh_session session) {
 
     // Channel + shell
     ssh_channel ch = nullptr;
+    bool is_tcpip = false;
+    char fwd_host[64] = {0};
+    int fwd_port = 0;
     while (true) {
         msg = ssh_message_get(session);
         if (!msg) break;
@@ -408,6 +516,15 @@ static void _run_session(ssh_session session) {
         int sub  = ssh_message_subtype(msg);
         if (type == SSH_REQUEST_CHANNEL_OPEN && sub == SSH_CHANNEL_SESSION) {
             ch = ssh_message_channel_request_open_reply_accept(msg);
+        } else if (type == SSH_REQUEST_CHANNEL_OPEN && sub == SSH_CHANNEL_DIRECT_TCPIP) {
+            // Jump host / port forward: client wants a TCP tunnel to host:port.
+            const char *dh = ssh_message_channel_request_open_destination(msg);
+            fwd_port = ssh_message_channel_request_open_destination_port(msg);
+            if (dh) strncpy(fwd_host, dh, sizeof(fwd_host) - 1);
+            ch = ssh_message_channel_request_open_reply_accept(msg);
+            is_tcpip = true;
+            ssh_message_free(msg);
+            break;
         } else if (ch && type == SSH_REQUEST_CHANNEL && sub == SSH_CHANNEL_REQUEST_PTY) {
             // Ack the PTY (without implementing real terminal modes) so the client
             // puts its terminal in raw mode and stops local-echoing: the shell loop
@@ -425,6 +542,12 @@ static void _run_session(ssh_session session) {
         ssh_message_free(msg);
     }
     if (!ch) return;
+
+    // A direct-tcpip channel is a tunnel, not a shell: pump bytes and return.
+    if (is_tcpip) {
+        _run_direct_tcpip(ch, fwd_host, fwd_port);
+        return;
+    }
 
     const char *banner = "\r\nBruce-TorSSH v1.0  |  type 'help'\r\n> ";
     ssh_channel_write(ch, banner, strlen(banner));
@@ -588,10 +711,10 @@ static bool _init_tor() {
     }
 
     _progress(18, "Downloading Tor consensus");
-    _status("Takes 5-10 min on first run.", TFT_DARKGREY);
-    _status("Screen stays still while it", TFT_DARKGREY);
-    _status("works - this is normal.", TFT_DARKGREY);
+    _status("Takes a few min on first run.", TFT_DARKGREY);
     _status("SD cache speeds up restarts.", TFT_DARKGREY);
+    // Live relay counter is drawn from Minitor's task (bus-safe) during the fetch.
+    v_set_minitor_progress_cb(_draw_fetch_progress);
 
     char buf[128];
     snprintf(buf, sizeof(buf), "[TOR] heap before init=%lu", (unsigned long)ESP.getFreeHeap());
@@ -605,6 +728,7 @@ static bool _init_tor() {
     g_tor_in_consensus = true;
     int tor_ret = d_minitor_INIT();
     g_tor_in_consensus = false;
+    v_set_minitor_progress_cb(NULL);
 
     // Do NOT re-add to WDT — the accept loop never calls esp_task_wdt_reset()
     // so re-adding would cause a WDT reboot after ~5 s of waiting for SSH clients.
