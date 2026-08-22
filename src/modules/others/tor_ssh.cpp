@@ -350,9 +350,18 @@ static void _run_session(ssh_session session) {
 
     while (!ssh_channel_is_closed(ch)) {
         int n = ssh_channel_read_timeout(ch, buf, sizeof(buf) - 1, 0, 100);
-        if (n < 0) break;
-        if (n == 0) {
+        // The session is non-blocking, so SSH_AGAIN (-2) just means "no data
+        // within the 100 ms poll window" — keep looping (and poll the device
+        // button). Only a real error (SSH_ERROR) or EOF ends the session; the
+        // old code treated every n<0 as fatal and dropped the session on the
+        // very first idle poll.
+        if (n == SSH_AGAIN) {
             if (check(EscPress)) break;
+            continue;
+        }
+        if (n < 0) break;                       // SSH_ERROR
+        if (n == 0) {                           // EOF or nothing pending
+            if (ssh_channel_is_eof(ch) || check(EscPress)) break;
             continue;
         }
         for (int i = 0; i < n; i++) {
