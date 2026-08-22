@@ -46,6 +46,9 @@ static void _reseed_ssh_drbg() {
 extern "C" {
 #include "minitor.h"
 extern volatile int g_minitor_relay_count;
+// Repoint where incoming .onion streams are forwarded (default loopback). Used
+// by gateway mode to relay to a LAN backend instead of the on-device server.
+void v_set_local_connection_addr(const char *addr);
 }
 
 // Set to true while worker is blocked in d_minitor_INIT() consensus download.
@@ -64,6 +67,33 @@ static volatile bool g_tor_in_consensus = false;
 #define TOR_ONION_DIR       "/sd/tor_ssh/hs"
 // SSH host key file (persisted on SD — generated once, reused every boot)
 #define TOR_SSH_HOST_KEY    "/sd/tor_ssh/ssh_host_ecdsa_key"
+// Optional gateway config: if this file exists and holds "IP:PORT", the .onion
+// forwards straight to that LAN backend (e.g. a PC's sshd) instead of running the
+// on-device shell — the board becomes a Tor gateway. Absent → local shell.
+#define TOR_SSH_FORWARD_CFG "/sd/tor_ssh/forward.txt"
+
+// Gateway (forward) mode state, loaded from TOR_SSH_FORWARD_CFG at start.
+static bool g_forward_mode  = false;
+static char g_forward_ip[16] = {0};
+static int  g_forward_port  = 22;
+
+// Parse TOR_SSH_FORWARD_CFG ("IP:PORT"). Sets g_forward_mode on success.
+static void _load_forward_config() {
+    g_forward_mode = false;
+    int fd = open(TOR_SSH_FORWARD_CFG, O_RDONLY);
+    if (fd < 0) return;
+    char b[64] = {0};
+    int n = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0) return;
+    char ip[16] = {0};
+    int port = 0;
+    if (sscanf(b, "%15[0-9.]:%d", ip, &port) == 2 && port > 0 && port < 65536) {
+        strncpy(g_forward_ip, ip, sizeof(g_forward_ip) - 1);
+        g_forward_port = port;
+        g_forward_mode = true;
+    }
+}
 
 // ── Internal state ─────────────────────────────────────────────────────────────
 
@@ -243,6 +273,7 @@ static bool _handle_ssh_cmd(ssh_session session, ssh_channel ch, const char *cmd
             "  onion          show .onion address\r\n"
             "  gpio <n> <v>   set GPIO pin (0/1)\r\n"
             "  adc <n>        read ADC pin\r\n"
+            "  gateway <ip> <port> | off   forward .onion to a LAN host\r\n"
             "  reboot         reboot device\r\n"
             "  exit           close session\r\n"
         );
@@ -275,6 +306,53 @@ static bool _handle_ssh_cmd(ssh_session session, ssh_channel ch, const char *cmd
             snprintf(resp, sizeof(resp), "ADC %d = %d\r\n", pin, analogRead(pin));
         } else {
             snprintf(resp, sizeof(resp), "usage: adc <pin>\r\n");
+        }
+    } else if (strncmp(cmd, "gateway", 7) == 0) {
+        const char *arg = cmd + 7;
+        while (*arg == ' ') arg++;
+        if (*arg == '\0') {
+            // status
+            int fd = open(TOR_SSH_FORWARD_CFG, O_RDONLY);
+            if (fd >= 0) {
+                char b[64] = {0};
+                int n = read(fd, b, sizeof(b) - 1);
+                close(fd);
+                for (int i = 0; i < n; i++) { if (b[i] == '\r' || b[i] == '\n') { b[i] = 0; break; } }
+                snprintf(resp, sizeof(resp), "gateway: forward .onion -> %s\r\n", b);
+            } else {
+                snprintf(resp, sizeof(resp), "gateway: off (local shell)\r\n");
+            }
+        } else if (strncmp(arg, "off", 3) == 0) {
+            remove(TOR_SSH_FORWARD_CFG);
+            ssh_channel_write(ch, "gateway off -> rebooting to local shell...\r\n", 43);
+            delay(500);
+            ESP.restart();
+            return false;
+        } else {
+            char ip[16] = {0};
+            int port = 0;
+            if (sscanf(arg, "%15[0-9.]:%d", ip, &port) == 2 ||
+                sscanf(arg, "%15[0-9.] %d", ip, &port) == 2) {
+                int fd = open(TOR_SSH_FORWARD_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                if (fd >= 0) {
+                    char line[32];
+                    int ln = snprintf(line, sizeof(line), "%s:%d\n", ip, port);
+                    write(fd, line, ln);
+                    fsync(fd);
+                    close(fd);
+                    char msg[96];
+                    int m = snprintf(msg, sizeof(msg),
+                                     "gateway -> %s:%d, rebooting to apply...\r\n", ip, port);
+                    ssh_channel_write(ch, msg, m);
+                    delay(500);
+                    ESP.restart();
+                    return false;
+                } else {
+                    snprintf(resp, sizeof(resp), "gateway: cannot write config\r\n");
+                }
+            } else {
+                snprintf(resp, sizeof(resp), "usage: gateway <ip> <port> | gateway off\r\n");
+            }
         }
     } else if (strncmp(cmd, "reboot", 6) == 0) {
         ssh_channel_write(ch, "Rebooting...\r\n", 14);
@@ -329,6 +407,12 @@ static void _run_session(ssh_session session) {
         int sub  = ssh_message_subtype(msg);
         if (type == SSH_REQUEST_CHANNEL_OPEN && sub == SSH_CHANNEL_SESSION) {
             ch = ssh_message_channel_request_open_reply_accept(msg);
+        } else if (ch && type == SSH_REQUEST_CHANNEL && sub == SSH_CHANNEL_REQUEST_PTY) {
+            // Ack the PTY (without implementing real terminal modes) so the client
+            // puts its terminal in raw mode and stops local-echoing: the shell loop
+            // below is the single echo source. Denying it caused the "PTY
+            // allocation request failed" warning and doubled every keystroke.
+            ssh_message_channel_request_reply_success(msg);
         } else if (ch && type == SSH_REQUEST_CHANNEL &&
                    (sub == SSH_CHANNEL_REQUEST_SHELL || sub == SSH_CHANNEL_REQUEST_EXEC)) {
             ssh_message_channel_request_reply_success(msg);
@@ -564,7 +648,17 @@ static bool _init_tor() {
             _sdlog("[TOR] HS dir not present — Minitor will create");
         }
     }
-    if (d_setup_onion_service(TOR_SSH_LOCAL_PORT, TOR_SSH_ONION_PORT, TOR_ONION_DIR) < 0) {
+    // Gateway mode: forward onion:PORT straight to the LAN backend; otherwise
+    // forward to the on-device SSH server on loopback.
+    int fwd_port = TOR_SSH_LOCAL_PORT;
+    if (g_forward_mode) {
+        v_set_local_connection_addr(g_forward_ip);
+        fwd_port = g_forward_port;
+        char fbuf[64];
+        snprintf(fbuf, sizeof(fbuf), "[TOR] gateway -> %s:%d", g_forward_ip, g_forward_port);
+        _sdlog(fbuf);
+    }
+    if (d_setup_onion_service(fwd_port, TOR_SSH_ONION_PORT, TOR_ONION_DIR) < 0) {
         fflush(stdout);
         _sdlog("[TOR] FATAL: onion service setup failed");
         _status("Hidden service setup failed!", TFT_RED);
@@ -752,7 +846,19 @@ static volatile bool g_worker_done    = false;
 static void _tor_ssh_worker(void *) {
     // Redraw a clean frame — the WiFi selector may have painted over the screen.
     _header("Tor SSH");
-    if (_init_ssh()) {
+    _load_forward_config();
+
+    if (g_forward_mode) {
+        // Gateway mode: no on-device SSH server — Minitor relays each .onion
+        // stream to the LAN backend. Bring up Tor and stay alive while its own
+        // tasks do the forwarding; the button stops it.
+        if (_init_tor()) {
+            _show_onion(g_onion_addr);
+            while (!check(EscPress)) delay(200);
+        } else {
+            delay(3000);
+        }
+    } else if (_init_ssh()) {
         if (_init_tor()) {
             _show_onion(g_onion_addr);
             _accept_loop();
