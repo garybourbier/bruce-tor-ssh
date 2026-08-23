@@ -196,6 +196,35 @@ static void _progress(uint8_t pct, const char *label) {
     tft.drawCentreString(pctbuf, tftWidth / 2, UI_BAR_Y + 3, 1);
 }
 
+// Live consensus-fetch bootstrap progress. Called from Minitor's insert task
+// (v_handle_crypto_and_insert) every 50 relays — same task that does the SD
+// inserts, so drawing to the shared-SPI TFT here is serialized and bus-safe. The
+// insert task stack is bumped to 40KB (port.c) to absorb this drawing. Grows the
+// bar 18->55% by relay count with a live counter so the screen no longer looks
+// frozen during the download.
+static void _draw_fetch_progress(int count) {
+    int capped = count > 8000 ? 8000 : count;
+    int pct = 18 + capped * 37 / 8000;
+
+    int bar_w = tftWidth - 16;
+    int fill_w = (bar_w - 2) * pct / 100;
+    tft.fillRect(9, UI_BAR_Y + 1, bar_w - 2, UI_BAR_H - 2, bruceConfig.bgColor);
+    if (fill_w > 0) tft.fillRect(9, UI_BAR_Y + 1, fill_w, UI_BAR_H - 2, bruceConfig.priColor);
+    char pctbuf[8];
+    snprintf(pctbuf, sizeof(pctbuf), "%u%%", (unsigned)pct);
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawCentreString(pctbuf, tftWidth / 2, UI_BAR_Y + 3, 1);
+
+    char b[40];
+    snprintf(b, sizeof(b), "Bootstrapping - relays: %d", count);
+    tft.fillRect(0, UI_DETAIL_Y0, tftWidth, UI_LINE_H, bruceConfig.bgColor);
+    tft.setTextSize(FP);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setCursor(4, UI_DETAIL_Y0);
+    tft.print(b);
+}
+
 static void _show_onion(const char *addr) {
     tft.fillScreen(bruceConfig.bgColor);
     tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
@@ -683,8 +712,10 @@ static bool _init_tor() {
 
     _progress(18, "Downloading Tor consensus");
     _status("Takes a few min on first run.", TFT_DARKGREY);
-    _status("Serial shows live relay count.", TFT_DARKGREY);
     _status("SD cache speeds up restarts.", TFT_DARKGREY);
+    // Live bootstrap progress on screen, drawn bus-safely from Minitor's insert
+    // task (40KB stack). No longer looks frozen at 18%.
+    v_set_minitor_progress_cb(_draw_fetch_progress);
 
     char buf[128];
     snprintf(buf, sizeof(buf), "[TOR] heap before init=%lu", (unsigned long)ESP.getFreeHeap());
@@ -698,6 +729,7 @@ static bool _init_tor() {
     g_tor_in_consensus = true;
     int tor_ret = d_minitor_INIT();
     g_tor_in_consensus = false;
+    v_set_minitor_progress_cb(NULL);
 
     // Do NOT re-add to WDT — the accept loop never calls esp_task_wdt_reset()
     // so re-adding would cause a WDT reboot after ~5 s of waiting for SSH clients.
