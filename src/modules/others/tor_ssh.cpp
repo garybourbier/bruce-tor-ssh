@@ -275,6 +275,29 @@ static bool _read_onion_address(const char *dir) {
 // write its output to the SSH client. serialDevice is temporarily pointed here
 // while running a CLI command, then restored. LF is translated to CRLF for the
 // terminal. Input methods are stubs — the CLI is fed via serialCli.parse().
+// ANSI theming to make the SSH console echo the T-Embed's purple UI.
+#define A_RST  "\033[0m"
+#define A_PUR  "\033[38;5;141m"    // purple (Bruce priColor)
+#define A_PURB "\033[1;38;5;141m"  // bold purple
+#define A_CYAN "\033[38;5;87m"
+#define A_GRN  "\033[38;5;83m"
+#define A_DIM  "\033[38;5;245m"
+#define A_CLR  "\033[2J\033[H"     // clear screen + cursor home
+#define A_HR   "\xE2\x94\x80"      // horizontal rule (U+2500)
+#define UI_COLS 46
+
+// Header like the device screen: clear, centred purple title, divider rule.
+static void _ui_header(ssh_channel ch, const char *title) {
+    String s = A_CLR A_PURB;
+    int pad = (UI_COLS - (int)strlen(title)) / 2;
+    for (int i = 0; i < pad; i++) s += " ";
+    s += title;
+    s += A_RST "\r\n" A_PUR;
+    for (int i = 0; i < UI_COLS; i++) s += A_HR;
+    s += A_RST "\r\n";
+    ssh_channel_write(ch, s.c_str(), s.length());
+}
+
 class SshSerialDevice : public SerialDevice {
 public:
     SshSerialDevice(ssh_channel ch) : _ch(ch) {}
@@ -321,34 +344,73 @@ static bool _handle_ssh_cmd(ssh_session session, ssh_channel ch, const char *cmd
 
     if (!cmd || *cmd == '\0') return true;
 
-    // ── Numbered menu ────────────────────────────────────────────────────────
-    // `menu` prints numbered quick-actions; typing the number then runs it. Any
-    // command can still be typed directly. Arg commands (gpio/gateway/ir tx/...)
-    // are typed by hand.
-    static const char *menu_cmds[] = {
-        "info", "wifi", "onion", "rfid info", "rfid read", "ir rx",
-        "rf rx", "rf scan", "settings", "reboot"
+    // ── Two-level menu (categories -> commands) ──────────────────────────────
+    // `menu` shows categories; pick a category number, then a command number.
+    // "0" goes back to categories. Any command can still be typed directly.
+    // Commands needing arguments just print their usage when picked.
+    static const char *m_system[] = {"info", "wifi", "onion", "uptime", "free", "reboot"};
+    static const char *m_rfid[]   = {"rfid info", "rfid read", "rfid write", "rfid clone",
+                                     "rfid emulate", "rfid erase", "rfid save", "rfid reset"};
+    static const char *m_ir[]     = {"ir rx", "ir tx", "ir tx_raw", "ir tx_from_file"};
+    static const char *m_rf[]     = {"rf rx", "rf tx", "rf txp", "rf scan", "rf mfcodes list"};
+    static const char *m_gpio[]   = {"gpio read", "gpio set", "gpio mode", "adc"};
+    static const char *m_storage[]= {"ls", "cat", "md5", "crc32", "stat"};
+    static const char *m_misc[]   = {"settings", "clock", "date", "i2c", "tone", "gateway off"};
+    struct MenuCat { const char *name; const char **cmds; int n; };
+    static const MenuCat cats[] = {
+        {"System", m_system, 6}, {"RFID", m_rfid, 8}, {"IR", m_ir, 4},
+        {"RF / CC1101", m_rf, 5}, {"GPIO / ADC", m_gpio, 4},
+        {"Storage", m_storage, 5}, {"Misc", m_misc, 6},
     };
-    static const int MENU_N = sizeof(menu_cmds) / sizeof(menu_cmds[0]);
-    static bool menu_active = false;
+    static const int NCATS = sizeof(cats) / sizeof(cats[0]);
+    static bool menu_on = false;
+    static int menu_cat = -1;
 
-    if (strncmp(cmd, "menu", 4) == 0) {
-        String m = "\r\n== Tor SSH menu ==\r\n";
-        for (int i = 0; i < MENU_N; i++)
-            m += "  " + String(i + 1) + ") " + menu_cmds[i] + "\r\n";
-        m += "Type a number, or any command. 'help' = list, ~78 Bruce cmds.\r\n";
+    auto show_cats = [&]() {
+        _ui_header(ch, "Tor SSH  -  MENU");
+        String m;
+        for (int i = 0; i < NCATS; i++)
+            m += String(A_PUR "  ") + (i + 1) + ") " A_RST A_CYAN + cats[i].name + A_RST "\r\n";
+        m += A_DIM "Pick a category. Any command works; 'help' = full list." A_RST "\r\n";
         ssh_channel_write(ch, m.c_str(), m.length());
-        menu_active = true;
-        return true;
-    }
-    if (menu_active) {
-        bool numeric = true;
+    };
+
+    if (strncmp(cmd, "menu", 4) == 0) { menu_on = true; menu_cat = -1; show_cats(); return true; }
+
+    if (menu_on) {
+        bool numeric = *cmd != '\0';
         for (const char *p = cmd; *p; p++)
             if (*p < '0' || *p > '9') { numeric = false; break; }
         if (numeric) {
-            menu_active = false;
-            int idx = atoi(cmd) - 1;
-            if (idx >= 0 && idx < MENU_N) cmd = menu_cmds[idx]; // fall through to run it
+            int num = atoi(cmd);
+            if (menu_cat < 0) { // picking a category
+                if (num >= 1 && num <= NCATS) {
+                    menu_cat = num - 1;
+                    const MenuCat &c = cats[menu_cat];
+                    String hdr = String("Tor SSH  -  ") + c.name;
+                    _ui_header(ch, hdr.c_str());
+                    String m;
+                    for (int i = 0; i < c.n; i++)
+                        m += String(A_PUR "  ") + (i + 1) + ") " A_RST A_GRN + c.cmds[i] + A_RST "\r\n";
+                    m += A_DIM "  0) back" A_RST "\r\n";
+                    ssh_channel_write(ch, m.c_str(), m.length());
+                } else {
+                    ssh_channel_write(ch, "Invalid category.\r\n", 19);
+                }
+                return true;
+            } else { // picking a command within the category
+                const MenuCat &c = cats[menu_cat];
+                if (num == 0) { menu_cat = -1; show_cats(); return true; }
+                if (num >= 1 && num <= c.n) {
+                    menu_on = false; menu_cat = -1;
+                    cmd = c.cmds[num - 1]; // fall through to run it
+                } else {
+                    ssh_channel_write(ch, "Invalid choice.\r\n", 17);
+                    return true;
+                }
+            }
+        } else {
+            menu_on = false; menu_cat = -1; // typed a real command: leave menu mode
         }
     }
 
@@ -610,8 +672,12 @@ static void _run_session(ssh_session session) {
         return;
     }
 
-    const char *banner = "\r\nBruce-TorSSH v1.0  |  type 'menu' or 'help'\r\n> ";
-    ssh_channel_write(ch, banner, strlen(banner));
+    _ui_header(ch, "Bruce-TorSSH  v1.0");
+    {
+        String b = A_DIM "SSH over Tor.  type " A_RST A_CYAN "menu" A_RST A_DIM " or " A_RST
+                   A_CYAN "help" A_RST "\r\n" A_PURB "tor" A_RST "> ";
+        ssh_channel_write(ch, b.c_str(), b.length());
+    }
 
     // Shell line-edit loop
     char buf[256], line[256] = {0};
@@ -639,7 +705,7 @@ static void _run_session(ssh_session session) {
                 line[lpos] = '\0';
                 ssh_channel_write(ch, "\r\n", 2);
                 if (!_handle_ssh_cmd(session, ch, line)) goto done;
-                ssh_channel_write(ch, "> ", 2);
+                ssh_channel_write(ch, A_PURB "tor" A_RST "> ", strlen(A_PURB "tor" A_RST "> "));
                 lpos = 0;
             } else if ((c == 0x7f || c == '\b') && lpos > 0) {
                 lpos--;
