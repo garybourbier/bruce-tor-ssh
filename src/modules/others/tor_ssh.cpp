@@ -321,6 +321,37 @@ static bool _handle_ssh_cmd(ssh_session session, ssh_channel ch, const char *cmd
 
     if (!cmd || *cmd == '\0') return true;
 
+    // ── Numbered menu ────────────────────────────────────────────────────────
+    // `menu` prints numbered quick-actions; typing the number then runs it. Any
+    // command can still be typed directly. Arg commands (gpio/gateway/ir tx/...)
+    // are typed by hand.
+    static const char *menu_cmds[] = {
+        "info", "wifi", "onion", "rfid info", "rfid read", "ir rx",
+        "rf rx", "rf scan", "settings", "reboot"
+    };
+    static const int MENU_N = sizeof(menu_cmds) / sizeof(menu_cmds[0]);
+    static bool menu_active = false;
+
+    if (strncmp(cmd, "menu", 4) == 0) {
+        String m = "\r\n== Tor SSH menu ==\r\n";
+        for (int i = 0; i < MENU_N; i++)
+            m += "  " + String(i + 1) + ") " + menu_cmds[i] + "\r\n";
+        m += "Type a number, or any command. 'help' = list, ~78 Bruce cmds.\r\n";
+        ssh_channel_write(ch, m.c_str(), m.length());
+        menu_active = true;
+        return true;
+    }
+    if (menu_active) {
+        bool numeric = true;
+        for (const char *p = cmd; *p; p++)
+            if (*p < '0' || *p > '9') { numeric = false; break; }
+        if (numeric) {
+            menu_active = false;
+            int idx = atoi(cmd) - 1;
+            if (idx >= 0 && idx < MENU_N) cmd = menu_cmds[idx]; // fall through to run it
+        }
+    }
+
     if (strncmp(cmd, "help", 4) == 0) {
         snprintf(resp, sizeof(resp),
             "Commands:\r\n"
@@ -579,7 +610,7 @@ static void _run_session(ssh_session session) {
         return;
     }
 
-    const char *banner = "\r\nBruce-TorSSH v1.0  |  type 'help'\r\n> ";
+    const char *banner = "\r\nBruce-TorSSH v1.0  |  type 'menu' or 'help'\r\n> ";
     ssh_channel_write(ch, banner, strlen(banner));
 
     // Shell line-edit loop
