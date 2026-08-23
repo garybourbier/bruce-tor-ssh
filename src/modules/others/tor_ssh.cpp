@@ -30,6 +30,9 @@
 #include <vector>
 
 #include "core/sd_functions.h"
+#include <globals.h>                       // serialCli, serialDevice
+#include <SerialDevice.h>                  // SerialDevice base class
+#include "core/serial_commands/cli.h"      // SerialCli (SimpleCLI wrapper)
 
 // LibSSH-ESP32 internal DRBG — reseed with hardware RNG before use
 // to avoid blocking on slow entropy sources when wolfSSL is also linked
@@ -268,6 +271,51 @@ static bool _read_onion_address(const char *dir) {
 
 // ── SSH server ─────────────────────────────────────────────────────────────────
 
+// SerialDevice backed by an SSH channel: lets Bruce's serial CLI (serialCli)
+// write its output to the SSH client. serialDevice is temporarily pointed here
+// while running a CLI command, then restored. LF is translated to CRLF for the
+// terminal. Input methods are stubs — the CLI is fed via serialCli.parse().
+class SshSerialDevice : public SerialDevice {
+public:
+    SshSerialDevice(ssh_channel ch) : _ch(ch) {}
+    size_t println(const String &s) override { size_t n = _put(s); _put(String("\n")); return n + 1; }
+    size_t print(const String &s) override { return _put(s); }
+    size_t print(const int n, int format) override { return _put(String(n, format)); }
+    void vprintf(const char *fmt, va_list args) override {
+        char buf[256];
+        int n = vsnprintf(buf, sizeof(buf), fmt, args);
+        if (n > 0) _put(String(buf));
+    }
+    size_t println() override { _put(String("\n")); return 1; }
+    size_t println(size_t n) override { return println(String((uint32_t)n)); }
+    size_t println(const uint32_t n) override { return println(String(n)); }
+    size_t println(const int n, int format) override { return println(String(n, format)); }
+    String readStringUntil(char terminator) override { return String(); }
+    void flush() override {}
+    int available() override { return 0; }
+    size_t write(uint8_t *str, size_t size) override {
+        if (_ch) ssh_channel_write(_ch, str, size);
+        return size;
+    }
+    int read() override { return -1; }
+
+private:
+    ssh_channel _ch;
+    size_t _put(const String &s) {
+        if (!_ch) return 0;
+        int start = 0, len = s.length();
+        for (int i = 0; i < len; i++) {
+            if (s[i] == '\n') {
+                if (i > start) ssh_channel_write(_ch, s.c_str() + start, i - start);
+                ssh_channel_write(_ch, "\r\n", 2);
+                start = i + 1;
+            }
+        }
+        if (start < len) ssh_channel_write(_ch, s.c_str() + start, len - start);
+        return len;
+    }
+};
+
 static bool _handle_ssh_cmd(ssh_session session, ssh_channel ch, const char *cmd) {
     char resp[512];
 
@@ -284,6 +332,8 @@ static bool _handle_ssh_cmd(ssh_session session, ssh_channel ch, const char *cmd
             "  gateway <ip> <port> | off   forward .onion to a LAN host\r\n"
             "  reboot         reboot device\r\n"
             "  exit           close session\r\n"
+            "  --- Bruce CLI (radios) ---\r\n"
+            "  rf / rfid / ir / wifi / gpio / ...  (type the verb for usage)\r\n"
         );
     } else if (strncmp(cmd, "info", 4) == 0) {
         snprintf(resp, sizeof(resp),
@@ -371,7 +421,16 @@ static bool _handle_ssh_cmd(ssh_session session, ssh_channel ch, const char *cmd
         ssh_channel_write(ch, "Bye.\r\n", 6);
         return false;
     } else {
-        snprintf(resp, sizeof(resp), "Unknown: %s\r\n", cmd);
+        // Route anything not handled above to Bruce's serial CLI (rf / rfid / ir /
+        // wifi / gpio / ...). Its output goes to the SSH channel via a temporary
+        // SerialDevice; restore the previous device afterwards. Invalid commands
+        // are reported by the CLI's own error callback.
+        SshSerialDevice sshDev(ch);
+        SerialDevice *prev = serialDevice;
+        serialDevice = &sshDev;
+        serialCli.parse(String(cmd));
+        serialDevice = prev;
+        return true;
     }
 
     ssh_channel_write(ch, resp, strlen(resp));
