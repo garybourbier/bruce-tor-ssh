@@ -19,6 +19,7 @@
 #include <freertos/task.h>
 #include <esp_heap_caps.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -33,6 +34,11 @@
 #include <globals.h>                       // serialCli, serialDevice
 #include <SerialDevice.h>                  // SerialDevice base class
 #include "core/serial_commands/cli.h"      // SerialCli (SimpleCLI wrapper)
+#include "core/wifi/webInterface.h"        // Bruce admin web panel (server, configureWebServer, stopWebUi)
+
+// Bruce's WebUI-active flag lives in main.cpp; configureWebServer()/stopWebUi()
+// key off it, so we must toggle it when driving the panel headless.
+extern bool isWebUIActive;
 
 // LibSSH-ESP32 internal DRBG — reseed with hardware RNG before use
 // to avoid blocking on slow entropy sources when wolfSSL is also linked
@@ -83,14 +89,35 @@ static volatile bool g_tor_in_consensus = false;
 // on-device shell — the board becomes a Tor gateway. Absent → local shell.
 #define TOR_SSH_FORWARD_CFG "/sd/tor_ssh/forward.txt"
 
+// Web-panel mode: if this marker file exists, the .onion serves Bruce's built-in
+// admin web panel (webInterface.cpp) over Tor instead of the SSH server. The
+// onion virtual port and the loopback backend are both 80 (plain HTTP — Tor
+// already encrypts and authenticates via the .onion address).
+#define TOR_WEB_CFG         "/sd/tor_ssh/web.txt"
+#define TOR_WEB_ONION_PORT  80
+#define TOR_WEB_LOCAL_PORT  80
+
 // Gateway (forward) mode state, loaded from TOR_SSH_FORWARD_CFG at start.
 static bool g_forward_mode  = false;
 static char g_forward_ip[16] = {0};
 static int  g_forward_port  = 22;
 
+// Web-panel mode state, loaded from TOR_WEB_CFG at start (mutually exclusive
+// with gateway mode).
+static bool g_web_mode      = false;
+
 // Parse TOR_SSH_FORWARD_CFG ("IP:PORT"). Sets g_forward_mode on success.
+// Also detects web-panel mode (TOR_WEB_CFG marker), which takes precedence.
 static void _load_forward_config() {
     g_forward_mode = false;
+    g_web_mode = false;
+
+    // Web-panel marker wins: if present, serve the panel and ignore gateway.
+    if (access(TOR_WEB_CFG, F_OK) == 0) {
+        g_web_mode = true;
+        return;
+    }
+
     int fd = open(TOR_SSH_FORWARD_CFG, O_RDONLY);
     if (fd < 0) return;
     char b[64] = {0};
@@ -225,6 +252,57 @@ static void _show_onion(const char *addr) {
     tft.drawString("service live  -  ESC to stop", 8, tftHeight - 14);
 
     Serial.printf("[TorSSH] .onion: %s\n", addr);
+}
+
+// Ready screen for web-panel mode: shows the http URL and the default creds.
+static void _show_web_panel(const char *addr) {
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setTextSize(FM);
+    tft.drawCentreString("Tor Web Panel", tftWidth / 2, 4, 1);
+    tft.drawLine(0, 24, tftWidth, 24, bruceConfig.priColor);
+
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_GREEN, bruceConfig.bgColor);
+    tft.drawString("Open in Tor Browser:", 8, 34);
+
+    // http://<onion>/ in a bordered box, split across two lines to fit 320px.
+    String url = String("http://") + addr + "/";
+    int box_y = 50;
+    tft.drawRect(4, box_y, tftWidth - 8, 32, bruceConfig.priColor);
+    tft.setTextColor(TFT_CYAN, bruceConfig.bgColor);
+    tft.drawString(url.substring(0, url.length() / 2), 10, box_y + 5);
+    tft.drawString(url.substring(url.length() / 2),     10, box_y + 17);
+
+    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+    tft.drawString("login: admin / bruce", 8, 92);
+    tft.setTextColor(TFT_YELLOW, bruceConfig.bgColor);
+    tft.drawString("change creds in Config!", 8, 104);
+
+    tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
+    tft.drawString("service live  -  ESC to stop", 8, tftHeight - 14);
+
+    Serial.printf("[TorSSH] web panel: http://%s/\n", addr);
+}
+
+// Bring up Bruce's admin web panel headless on loopback:80 (WiFi is already up
+// by the time the worker runs). configureWebServer() registers all routes and
+// calls server->begin(); Minitor then proxies .onion:80 -> 127.0.0.1:80.
+static bool _start_web_panel() {
+    if (!server) {
+        if (psramFound()) server = (AsyncWebServer *)ps_malloc(sizeof(AsyncWebServer));
+        else              server = (AsyncWebServer *)malloc(sizeof(AsyncWebServer));
+        if (!server) {
+            _sdlog("[WEB] FATAL: no memory for web server");
+            return false;
+        }
+        new (server) AsyncWebServer(TOR_WEB_LOCAL_PORT);
+        configureWebServer();
+        isWebUIActive = true;
+    }
+    tft.setLogging();   // enables the /getscreen live mirror
+    _sdlog("[WEB] admin panel up on 127.0.0.1:80");
+    return true;
 }
 
 // ── Read .onion address from filesystem ────────────────────────────────────────
@@ -900,15 +978,21 @@ static bool _init_tor() {
     }
     // Gateway mode: forward onion:PORT straight to the LAN backend; otherwise
     // forward to the on-device SSH server on loopback.
-    int fwd_port = TOR_SSH_LOCAL_PORT;
-    if (g_forward_mode) {
+    int fwd_port   = TOR_SSH_LOCAL_PORT;
+    int onion_port = TOR_SSH_ONION_PORT;
+    if (g_web_mode) {
+        // Serve the on-device admin panel: onion:80 -> 127.0.0.1:80.
+        fwd_port   = TOR_WEB_LOCAL_PORT;
+        onion_port = TOR_WEB_ONION_PORT;
+        _sdlog("[TOR] web panel mode -> 127.0.0.1:80");
+    } else if (g_forward_mode) {
         v_set_local_connection_addr(g_forward_ip);
         fwd_port = g_forward_port;
         char fbuf[64];
         snprintf(fbuf, sizeof(fbuf), "[TOR] gateway -> %s:%d", g_forward_ip, g_forward_port);
         _sdlog(fbuf);
     }
-    if (d_setup_onion_service(fwd_port, TOR_SSH_ONION_PORT, TOR_ONION_DIR) < 0) {
+    if (d_setup_onion_service(fwd_port, onion_port, TOR_ONION_DIR) < 0) {
         fflush(stdout);
         _sdlog("[TOR] FATAL: onion service setup failed");
         _status("Hidden service setup failed!", TFT_RED);
@@ -1072,6 +1156,11 @@ static void _accept_loop() {
 }
 
 static void _cleanup() {
+    if (server) {
+        // Web-panel mode: tear down the AsyncWebServer (frees the server object
+        // and clears isWebUIActive/logging).
+        stopWebUi();
+    }
     if (g_sshbind) {
         // ssh_bind_free() already frees the imported host key (SSH_BIND_OPTIONS_
         // IMPORT_KEY transfers ownership into sshbind->ecdsa), so we must NOT free
@@ -1103,7 +1192,16 @@ static void _tor_ssh_worker(void *) {
     _header("Tor SSH");
     _load_forward_config();
 
-    if (g_forward_mode) {
+    if (g_web_mode) {
+        // Web-panel mode: no SSH server — start Bruce's admin panel on loopback
+        // and let Minitor proxy .onion:80 to it. Stay alive until the button.
+        if (_start_web_panel() && _init_tor()) {
+            _show_web_panel(g_onion_addr);
+            while (!check(EscPress)) delay(200);
+        } else {
+            delay(3000);
+        }
+    } else if (g_forward_mode) {
         // Gateway mode: no on-device SSH server — Minitor relays each .onion
         // stream to the LAN backend. Bring up Tor and stay alive while its own
         // tasks do the forwarding; the button stops it.
@@ -1145,7 +1243,22 @@ static bool _select_tor_mode() {
 
     options.push_back({"Local shell", [&]() {
         remove(TOR_SSH_FORWARD_CFG);
+        remove(TOR_WEB_CFG);
         proceed = true;
+    }});
+
+    options.push_back({"Web panel", [&]() {
+        remove(TOR_SSH_FORWARD_CFG);
+        int fd = open(TOR_WEB_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            write(fd, "web\n", 4);
+            fsync(fd);
+            close(fd);
+            proceed = true;
+        } else {
+            _status("Cannot write config", TFT_RED);
+            delay(1500);
+        }
     }});
 
     String gwLabel = g_forward_mode
@@ -1159,6 +1272,7 @@ static bool _select_tor_mode() {
         char ip[16] = {0};
         int port = 0;
         if (sscanf(in.c_str(), "%15[0-9.]:%d", ip, &port) == 2 && port > 0 && port < 65536) {
+            remove(TOR_WEB_CFG);
             int fd = open(TOR_SSH_FORWARD_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0600);
             if (fd >= 0) {
                 char l[32];
